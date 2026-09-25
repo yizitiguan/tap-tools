@@ -53,21 +53,12 @@ def apply(root):
     root.configure(bg=BG, highlightbackground=LINE)
 
     st.configure("TFrame", background=SURFACE)
-    st.configure("Rail", background=BG)
-    st.configure("Card", background=RAISED, borderwidth=1, relief="solid")
     st.configure("Card.TFrame", background=RAISED)
     st.configure("Panel.TFrame", background=SURFACE)
 
     st.configure("TLabel", background=SURFACE, foreground=TEXT, font=ui(10))
     st.configure("Dim.TLabel", background=SURFACE, foreground=DIM, font=ui(9))
-    st.configure("Faint.TLabel", background=SURFACE, foreground=FAINT, font=ui(9))
-    st.configure("Title.TLabel", background=SURFACE, foreground=TEXT, font=ui(13, "bold"))
     st.configure("Section.TLabel", background=SURFACE, foreground=TEXT, font=ui(11, "bold"))
-    st.configure("Card.TLabel", background=RAISED, foreground=TEXT, font=ui(10))
-    st.configure("CardDim.TLabel", background=RAISED, foreground=DIM, font=ui(9))
-    st.configure("Rail.TLabel", background=BG, foreground=TEXT, font=ui(10))
-    st.configure("Data.TLabel", background=SURFACE, foreground=TEXT, font=mono(10))
-    st.configure("CardData.TLabel", background=RAISED, foreground=TEXT, font=mono(10))
 
     # buttons: flat raised slab, colour shift is the only affordance Tk gives
     st.configure("TButton", background=RAISED, foreground=TEXT, font=ui(10),
@@ -111,11 +102,6 @@ def apply(root):
     st.map("TSpinbox", fieldbackground=[("focus", "#242d37")],
            bordercolor=[("focus", AMBER)])
 
-    st.configure("TLabelframe", background=SURFACE, bordercolor=LINE_SOFT,
-                 relief="solid", borderwidth=1)
-    st.configure("TLabelframe.Label", background=SURFACE, foreground=DIM,
-                 font=ui(9, "bold"))
-
     st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=0)
     st.configure("TNotebook.Tab", background=SURFACE, foreground=DIM, font=ui(10),
                  padding=(L, S + 2), borderwidth=0)
@@ -123,15 +109,9 @@ def apply(root):
            foreground=[("selected", TEXT), ("active", TEXT)],
            expand=[("selected", (0, 0, 0, 0))])
 
-    st.configure("Horizontal.TSeparator", background=LINE_SOFT)
-    st.configure("Vertical.TSeparator", background=LINE_SOFT)
-
     st.configure("Vertical.TScrollbar", background=RAISED, troughcolor=SURFACE,
                  arrowcolor=DIM, bordercolor=SURFACE)
     st.map("Vertical.TScrollbar", background=[("active", HOVER)])
-
-    st.configure("Horizontal.TProgressbar", background=AMBER, troughcolor=LINE_SOFT,
-                 bordercolor=SURFACE, lightcolor=AMBER, darkcolor=AMBER)
     return st
 
 
@@ -149,18 +129,6 @@ def text_widget(parent, **kw):
     return tk.Text(parent, **kw)
 
 
-def entry(parent, **kw):
-    kw.setdefault("background", RAISED)
-    kw.setdefault("foreground", TEXT)
-    kw.setdefault("insertbackground", AMBER)
-    kw.setdefault("relief", "flat")
-    kw.setdefault("highlightthickness", 1)
-    kw.setdefault("highlightbackground", LINE)
-    kw.setdefault("highlightcolor", AMBER)
-    kw.setdefault("font", mono(11))
-    return tk.Entry(parent, **kw)
-
-
 def canvas(parent, **kw):
     kw.setdefault("background", "#0c0f13")
     kw.setdefault("highlightthickness", 0)
@@ -173,12 +141,7 @@ def rule(parent, orient="horizontal", **kw):
     equivalent of a 1px rule and carries the same rhythm."""
     kw.setdefault("height" if orient == "horizontal" else "width", 1)
     kw.setdefault("background", LINE_SOFT)
-    f = tk.Frame(parent, **kw)
-    if orient == "horizontal":
-        f.configure(bd=0)
-    else:
-        f.configure(bd=0)
-    return f
+    return tk.Frame(parent, bd=0, **kw)
 
 
 def chip(parent, text, command, accent=None):

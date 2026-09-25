@@ -91,10 +91,10 @@
   },
   "active_preset": "sc",
   "target_times": [
-    "11:24:37.000"
+    "09:40:00"
   ],
   "_comment_times": "每行一个时刻；只写 HH:MM:SS 会自动算今天（已过则明天），也可写完整日期。到点按先后依次自动开火。",
   "_comment_var": "单发 input 进程耗时实测 35~118ms，这是抖动的唯一来源：命中误差中位 ±10ms 但尾部到 ±65ms，两下间隔请求 40~60 实测 1~94。要压掉它只能换成设备常驻注入（uiautomator2 socket），不起进程。",
   "focus": "",
-  "phone_stay_awake": false
+  "phone_stay_awake": true
 }
