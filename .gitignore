@@ -1,0 +1,22 @@
+# 打包产物：由 src/ 重新生成，不入库
+DoubleTap.exe
+_internal/
+build/
+dist/
+*.spec
+
+# adb 是下载的官方工具，不入库（版本见 platform-tools 内 source.properties）
+platform-tools/
+
+# 运行期生成
+shot.png
+doubletap.log
+doubletap.log.*
+crash.log
+t_cfg.json
+_t.py
+_t.json
+
+# Python
+__pycache__/
+*.pyc
