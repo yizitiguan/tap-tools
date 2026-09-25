@@ -83,7 +83,16 @@ class App(tk.Tk):
         self.cancel = threading.Event()
         self.pts = []
         self._armed = False
+        self._t0 = None
+        self._notice_job = None
+        self._logfh = None
+        self._logpath = None
+        self._follow = True
+        self._behind = 0
         theme.apply(self)
+        # A Tk callback exception would otherwise surface as a modal (or, in
+        # the --windowed build where stdout is None, as nothing at all).
+        self.report_callback_exception = self._on_callback_error
         self._build()
         self.after(80, self._pump)
         self.log(f"adb: {adbutil.ADB}")
@@ -132,8 +141,15 @@ class App(tk.Tk):
         self.rail_mode = tk.Label(side_ctl, text="", bg=theme.BG, fg=theme.FAINT,
                                   font=theme.mono(9))
         self.rail_mode.pack(anchor="e", pady=(theme.S, 0))
-        theme.rule(rail).grid(row=1, column=0, columnspan=3, sticky="ew",
-                              pady=(theme.M, 0))
+        # Replaces the "you clicked while busy" and "task failed" dialogs. A
+        # modal runs a nested Tk loop and hides the countdown, which is exactly
+        # what you cannot afford during a watch.
+        self.notice = tk.Label(rail, text="", bg=theme.BG, fg=theme.DIM,
+                               font=theme.ui(9), anchor="w", justify="left")
+        self.notice.grid(row=1, column=0, columnspan=3, sticky="ew",
+                         padx=(theme.L, theme.L))
+        theme.rule(rail).grid(row=2, column=0, columnspan=3, sticky="ew",
+                              pady=(theme.XS, 0))
 
         # -- tabs -------------------------------------------------------------
         nb = ttk.Notebook(self)
@@ -153,23 +169,45 @@ class App(tk.Tk):
         side.rowconfigure(1, weight=1)
         side.columnconfigure(0, weight=1)
         head = tk.Frame(side, bg=theme.SURFACE)
-        head.grid(row=0, column=0, sticky="ew", pady=(0, theme.S))
+        head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, theme.S))
         tk.Label(head, text="运行日志", bg=theme.SURFACE, fg=theme.DIM,
                  font=theme.ui(9, "bold")).pack(side="left")
-        tk.Label(head, text="悬停查看含义", bg=theme.SURFACE, fg=theme.FAINT,
-                 font=theme.ui(9)).pack(side="right")
-        self.txt = theme.text_widget(side, width=56, height=10, state="disabled",
-                                     font=theme.mono(9))
+        # Clickable, and it is the only honest way to say "new lines arrived
+        # while you were reading history" without yanking the viewport.
+        self.newlines_lbl = tk.Label(head, text="", bg=theme.SURFACE,
+                                     fg=theme.FAINT, font=theme.ui(9),
+                                     cursor="hand2")
+        self.newlines_lbl.pack(side="right")
+        self.newlines_lbl.bind("<Button-1>", lambda e: self._jump_to_end())
+
+        # Left permanently selectable. `state="disabled"` used to make the whole
+        # panel uncopyable, which is the opposite of what a log is for; typing
+        # is blocked per-event instead.
+        self.txt = theme.text_widget(side, width=56, height=10,
+                                     font=theme.mono(9), wrap="word")
         self.txt.grid(row=1, column=0, sticky="nsew")
+        self.txt.bind("<Key>", lambda e: "break")
+        for seq in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Control-y>",
+                    "<Button-2>"):
+            self.txt.bind(seq, lambda e: "break")
+        sb = ttk.Scrollbar(side, orient="vertical", style="Vertical.TScrollbar",
+                           command=self.txt.yview)
+        sb.grid(row=1, column=1, sticky="ns")
+        self.txt.config(yscrollcommand=self._scroll_follow)
+        # bound per-widget, never bind_all: that would steal wheel events from
+        # the 坐标 canvas and from every Combobox dropdown
+        self.txt.bind("<MouseWheel>", self._wheel)
+        sb.bind("<MouseWheel>", self._wheel)
+        self.txt.bind("<Button-4>", lambda e: self.txt.yview_scroll(-3, "units"))
+        self.txt.bind("<Button-5>", lambda e: self.txt.yview_scroll(3, "units"))
         for tag, col in (("ok", theme.OK), ("bad", theme.BAD),
-                         ("warn", theme.AMBER), ("dim", theme.FAINT),
-                         ("ts", theme.FAINT)):
+                         ("warn", theme.AMBER), ("dim", theme.FAINT)):
             self.txt.tag_configure(tag, foreground=col)
         bar = tk.Frame(side, bg=theme.SURFACE)
-        bar.grid(row=2, column=0, sticky="ew", pady=(theme.S, 0))
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(theme.S, 0))
         ttk.Button(bar, text="清空", style="Ghost.TButton",
-                   command=lambda: self._edit(
-                       lambda: self.txt.delete("1.0", "end"))).pack(side="left")
+                   command=lambda: (self.txt.delete("1.0", "end"),
+                                    self._jump_to_end())).pack(side="left")
         ttk.Button(bar, text="打开日志文件", style="Ghost.TButton",
                    command=self._open_log).pack(side="left", padx=(theme.S, 0))
 
@@ -464,49 +502,127 @@ class App(tk.Tk):
         self.log(f"已设为 {secs} 秒后：{t}")
 
     # ---------- plumbing ----------
+    LOG_MAX = 512 * 1024
+
     def log(self, msg):
         msg = str(msg)
-        # mirror to a file: a shot that silently did the wrong thing is only
-        # diagnosable afterwards if something survived the window closing
-        try:
-            stamp = datetime.now().strftime("%m-%d %H:%M:%S.%f")[:-3]
-            with open(adbutil.pkgdir() / "doubletap.log", "a", encoding="utf-8") as fh:
-                fh.write(f"[{stamp}] {msg}\n")
-        except OSError:
-            pass
+        self._write_log_file(msg)
         self.q.put(("log", msg))
 
-    def _pump(self):
+    def _write_log_file(self, msg):
+        """Append one line with a persistent handle.
+
+        The old code opened and closed the file per line. That is a syscall
+        pair on whatever thread called log(), and fire.py calls say() right
+        after the newline that triggers tap B -- so in sequence mode a file
+        write sat between the two taps.
+        """
         try:
-            while True:
-                kind, payload = self.q.get_nowait()
-                if kind == "log":
-                    self._edit(lambda p=payload: (
-                        self.txt.insert("end", p + "\n", self._tag_for(p)),
-                        self.txt.see("end")))
-                elif kind == "cd":
-                    self.big.config(text=_fmt_cd(payload), foreground=theme.AMBER)
-                elif kind == "state":
-                    text, color = payload
-                    self.state_lbl.config(text=text, background=color,
-                                          fg="#0d1014")
-                elif kind == "done":
-                    if payload is None:
-                        self._set_idle("未发射", theme.BAD)
-                    else:
-                        n = payload.get("shots") if isinstance(payload, dict) else None
-                        self._set_idle(f"已发射 {n} 发" if n else "完成",
-                                       theme.OK if n else theme.AMBER)
-                    if payload:
-                        self._show_cal(payload)
-                elif kind == "error":
-                    self._set_idle("失败 · 未发射", theme.BAD)
-                    messagebox.showerror("任务失败，没有发射", payload)
-                elif kind == "cal":
-                    self._show_cal(payload)
-        except queue.Empty:
-            pass
-        self.after(60, self._pump)
+            if self._logfh is None:
+                self._logpath = adbutil.pkgdir() / "doubletap.log"
+                self._logfh = open(self._logpath, "a", encoding="utf-8")
+            # Renaming under an AV filter can spike to milliseconds, and the
+            # only moment that matters is the watch itself.
+            if (not self._armed and self._logpath.stat().st_size > self.LOG_MAX):
+                self._rotate_log()
+            stamp = datetime.now().strftime("%m-%d %H:%M:%S.%f")[:-3]
+            self._logfh.write(f"[{stamp}] {msg}\n")
+            self._logfh.flush()
+        except OSError:
+            # logging must never be the reason a shot fails
+            self._logfh = None
+
+    def _rotate_log(self):
+        self._logfh.close()
+        self._logfh = None
+        for i in (2, 1, 0):
+            src = self._logpath if i == 0 else self._logpath.with_suffix(f".log.{i}")
+            if not src.exists():
+                continue
+            dst = self._logpath.with_suffix(f".log.{i + 1}") if i < 2 else None
+            if dst is not None:
+                os.replace(src, dst)
+        self._logfh = open(self._logpath, "w", encoding="utf-8")
+
+    def _pump(self):
+        """Drain the queue and apply it to widgets.
+
+        Two hard rules, both learned the expensive way:
+        * the reschedule lives in `finally`. A handler that raises must not
+          take the countdown and the log panel down with it for the rest of
+          the session.
+        * no modal is ever opened from here. messagebox runs a nested Tk
+          event loop, so _pump re-enters itself while the dialog is up.
+        """
+        try:
+            events, logs = [], []
+            for _ in range(400):
+                try:
+                    item = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                if item[0] == "log":
+                    logs.append(item[1])
+                else:
+                    events.append(item)
+            # the number the user is watching must never sit behind a wall of
+            # log lines, so apply status first and only the last countdown
+            cd = [e for e in events if e[0] == "cd"]
+            order = [e for e in events if e[0] == "state"] \
+                + cd[-1:] + [e for e in events if e[0] not in ("state", "cd")]
+            for kind, *rest in order:
+                try:
+                    self._apply(kind, *rest)
+                except BaseException as e:
+                    self.txt.insert("end", f"!! 事件处理失败 {kind}: "
+                                f"{e.__class__.__name__}: {e}\n", ("bad",))
+            if logs:
+                self._append_logs(logs)
+        finally:
+            self.after(60, self._pump)
+
+    def _apply(self, kind, *rest):
+        if kind == "cd":
+            self.big.config(text=_fmt_cd(rest[0]), foreground=theme.AMBER)
+        elif kind == "state":
+            text, color = rest[0]
+            self.state_lbl.config(text=text, background=color, fg="#0d1014")
+        elif kind == "notice":
+            text, color, ms = rest[0]
+            self._show_notice(text, color, ms)
+        elif kind == "result":
+            name, payload = rest[0]
+            if name == "arm":
+                n = payload.get("shots") if isinstance(payload, dict) else None
+                self._set_idle(f"已发射 {n} 发" if n else "未发射",
+                               theme.OK if n else theme.BAD)
+            elif name == "cal":
+                self._show_cal(payload)
+        elif kind == "error":
+            self._set_idle("失败 · 未发射", theme.BAD)
+            self._show_notice(rest[0], theme.BAD, 15000)
+        elif kind == "cal":
+            self._show_cal(rest[0])
+
+    def _append_logs(self, lines):
+        blob = "".join(l + "\n" for l in lines)
+        tags = [self._tag_for(l) for l in lines]
+        # Tag by explicit line number. The relative form (end-Nlines) is easy to
+        # get wrong and silently miscolours the wrong rows.
+        first = int(self.txt.index("end-1c").split(".")[0])
+        self.txt.insert("end", blob)
+        for i, t in enumerate(tags):
+            if t:
+                self.txt.tag_add(t[0], f"{first + i}.0", f"{first + i + 1}.0")
+        if self._follow:
+            self.txt.see("end")
+        else:
+            self._behind += len(lines)
+            self.newlines_lbl.config(text=f"↓ {self._behind} 条新日志", fg=theme.AMBER)
+        # trim only while pinned to the bottom: deleting above the viewport
+        # while the user is reading history makes the view jump
+        if self._follow and int(self.txt.index("end-1c").split(".")[0]) > 2000:
+            self.txt.delete("1.0", f"{first - 1000}.0")
 
     @staticmethod
     def _tag_for(line):
@@ -522,37 +638,95 @@ class App(tk.Tk):
             return ("dim",)
         return ()
 
+    def _scroll_follow(self, first, last):
+        """The scrollbar callback is the one signal that catches every way of
+        moving the view, including dragging the thumb."""
+        try:
+            self._follow = float(last) >= 0.999
+        except ValueError:
+            return
+        if self._follow:
+            self._behind = 0
+            self.newlines_lbl.config(text="", fg=theme.FAINT)
+
+    def _unfollow(self, event=None):
+        if event is not None and getattr(event, "delta", 0) > 0:
+            pass
+        if self.txt.yview() != ("0.0", "1.0"):
+            self._follow = False
+        return None
+
+    def _wheel(self, event):
+        step = -1 * (event.delta // abs(event.delta)) * 3
+        self.txt.yview_scroll(step, "units")
+        self._follow = float(self.txt.yview()[1]) < 0.999
+        if self._follow:
+            self._behind = 0
+            self.newlines_lbl.config(text="", fg=theme.FAINT)
+        return "break"
+
+    def _jump_to_end(self):
+        self.txt.see("end")
+        self._follow = True
+        self._behind = 0
+        self.newlines_lbl.config(text="", fg=theme.FAINT)
+
+    def _on_callback_error(self, exc_type, exc, tb):
+        """Keep a Tk callback failure inside the log instead of a popup."""
+        try:
+            self.txt.insert("end",
+                            "!! 未捕获异常 " + exc_type.__name__ + ": " + str(exc) + "\n",
+                            ("bad",))
+            self.txt.see("end")
+        except Exception:
+            pass
+
+    def _show_notice(self, text, color, ms):
+        self.notice.config(text=text, fg=color)
+        if self._armed:
+            return  # do not wipe a warning during the watch
+        if self._notice_job:
+            self.after_cancel(self._notice_job)
+        self._notice_job = self.after(ms, self._clear_notice)
+
+    def _clear_notice(self):
+        self._notice_job = None
+        if not self._armed:
+            self.notice.config(text="")
+
     def _set_idle(self, state_text, color):
         self.state_lbl.config(text=state_text, background=color, fg="#0d1014")
-        now = datetime.now()
-        self.big.config(text=now.strftime("%H:%M:%S"), foreground=theme.FAINT)
+        self.big.config(text=datetime.now().strftime("%H:%M:%S"),
+                        foreground=theme.FAINT)
         self.rail_next.config(text=state_text)
 
-    def _edit(self, fn):
-        self.txt.config(state="normal"); fn(); self.txt.config(state="disabled")
-
-    def _worker(self, fn, *a):
-        if self.busy:
-            messagebox.showwarning("忙碌", "上一个任务还没结束")
+    def _worker(self, fn, *a, name="task", label=None):
+        """Run fn on a thread. Refusing a double-start is a rail notice, never
+        a dialog -- a modal hides the countdown at the worst possible moment."""
+        if self.busy or self._armed:
+            what = label or "上一个任务"
+            secs = (adbutil.now_ms() - self._t0) / 1000.0 if self._t0 else 0
+            self.q.put(("notice", (f"{what}还在进行（{secs:.0f}s），这次点击已忽略",
+                                   theme.AMBER, 6000)))
             return
         self.busy = True
+        self._t0 = adbutil.now_ms()
         self.cancel.clear()
 
         def run():
             try:
                 r = fn(*a)
-                self.q.put(("done", r))
+                self.q.put(("result", (name, r)))
             except BaseException as e:
-                # thread boundary: anything escaping here would otherwise die
-                # silently and leave the UI wedged, so catch SystemExit too.
-                # Surface it as a red banner, not just a log line -- a schedule
-                # that aborted before firing anything must not look like "就绪".
+                # SystemExit included: adbutil.ensure_device raises it, and an
+                # escaping exception here used to look like a successful no-op.
                 msg = f"{e.__class__.__name__}: {e}"
                 self.log(f"!! {msg}")
                 self.log(traceback.format_exc(limit=4))
                 self.q.put(("error", msg))
             finally:
                 self.busy = False
+                self._t0 = None
         threading.Thread(target=run, daemon=True).start()
 
     def _say(self, m):
@@ -606,7 +780,7 @@ class App(tk.Tk):
             except Exception as e:
                 self.log(f"!! {e}")
             return None
-        self._worker(go)
+        self._worker(go, name="dev", label="音量键检测")
 
     def _toggle_taps(self, on):
         try:
@@ -783,7 +957,7 @@ class App(tk.Tk):
                 self.log(f"=> 真实时间 = 本机时间 {off:+.1f}ms，本机{'慢' if off > 0 else '快'}"
                          f"了 {abs(off):.0f}ms")
             return None
-        self._worker(go)
+        self._worker(go, name="dev", label="时钟测量")
 
     def _mode_changed(self):
         """Each mode has its own measured lead, so swap the field when the user
@@ -831,7 +1005,7 @@ class App(tk.Tk):
             if res:
                 self.q.put(("cal", res))
             return None
-        self._worker(go)
+        self._worker(go, name="cal", label="排练")
 
     def _show_cal(self, res):
         e = [x["first_late_ms"] for x in res]
@@ -1063,10 +1237,14 @@ class App(tk.Tk):
 
         def go():
             self.log("--- 试射（排练模式，不会真点屏幕）---")
-            fire.one_shot(cfg, t, True, rehearse=True, say=self._say, tick=self._tick,
-                          cancel=self.cancel.is_set)
+            # report the measurement: this is the only way to see the timing
+            # of the actual GUI code path, since the CLI never imports gui.py
+            r = fire.one_shot(cfg, t, True, rehearse=True, say=self._say,
+                              tick=self._tick, cancel=self.cancel.is_set)
+            if r:
+                self.q.put(("cal", [r]))
             return None
-        self._worker(go)
+        self._worker(go, name="test", label="试射")
 
 
 def main():
