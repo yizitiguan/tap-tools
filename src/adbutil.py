@@ -122,22 +122,34 @@ def _ntp_epoch(raw):
     return secs - 2208988800.0 + frac
 
 
-def ntp_offset_ms(servers=NTP_SERVERS, samples=3):
+def ntp_offset_ms(servers=NTP_SERVERS, samples=3, budget=6.0):
     """Return (offset_ms, detail) where true_time = pc_time + offset_ms/1000.
 
     Negative offset means your PC clock runs FAST. A machine with Windows Time
     stopped routinely sits hundreds of ms off, which is far more damaging to a
     scheduled tap than any injection latency.
+
+    `budget` is a hard wall-clock deadline. Without one this function is 4
+    servers x 3 samples x a 3s socket timeout = up to 36s when UDP 123 is
+    blocked, and it used to run inside the countdown, so arming with 30s of
+    slack missed the shot entirely while 60s of slack worked. That is the whole
+    difference between "it worked once and then never again".
     """
     import statistics
+    deadline = time.time() + budget
     best = {}
     for srv in servers:
+        if time.time() > deadline:
+            break
         vals = []
         for _ in range(samples):
+            if time.time() > deadline:
+                break
             try:
                 import socket
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.settimeout(3)
+                left = max(0.4, deadline - time.time())
+                s.settimeout(min(2.0, left))
                 t0 = time.time()
                 s.sendto(b"\x1b" + 47 * b"\0", (srv, 123))
                 data, _ = s.recvfrom(64)
@@ -145,7 +157,7 @@ def ntp_offset_ms(servers=NTP_SERVERS, samples=3):
                 s.close()
                 vals.append((( _ntp_epoch(data[32:40]) - t0)
                              + (_ntp_epoch(data[40:48]) - t1)) / 2.0 * 1000)
-            except Exception as e:
+            except Exception:
                 vals.append(None)
         good = [v for v in vals if v is not None]
         if good:
@@ -214,7 +226,7 @@ def screen_on():
     return m.group(1).upper() == "ON"
 
 
-def display_state():
+def display_state(timeout=6.0):
     """(screen_on, focus) from ONE adb launch.
 
     The pre-shot check used to spend three separate `dumpsys` subprocesses
@@ -223,7 +235,8 @@ def display_state():
     """
     try:
         out = sh("dumpsys display 2>/dev/null | grep -m1 'mScreenState=';"
-                 "dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus='")
+                 "dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus='",
+                 timeout=timeout)
     except Exception:
         return None, ""
     on = None

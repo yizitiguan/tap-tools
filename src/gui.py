@@ -95,6 +95,7 @@ class App(tk.Tk):
         self.report_callback_exception = self._on_callback_error
         self._build()
         self.after(80, self._pump)
+        self.after(500, self._idle_clock)
         self.log(f"adb: {adbutil.ADB}")
         self.log(f"config: {CFG_PATH}")
         self.refresh_device()
@@ -702,9 +703,20 @@ class App(tk.Tk):
 
     def _set_idle(self, state_text, color):
         self.state_lbl.config(text=state_text, background=color, fg="#0d1014")
-        self.big.config(text=datetime.now().strftime("%H:%M:%S"),
-                        foreground=theme.FAINT)
         self.rail_next.config(text=state_text)
+        self._idle_clock()
+
+    def _idle_clock(self):
+        """Keep the big readout live while nothing is armed.
+
+        It used to be a single snapshot taken when a task finished, which made
+        the clock look frozen mid-session -- indistinguishable from the pump
+        having died, so you could not tell a dead UI from an idle one.
+        """
+        if not self._armed:
+            self.big.config(text=datetime.now().strftime("%H:%M:%S"),
+                            foreground=theme.FAINT)
+        self.after(500, self._idle_clock)
 
     def _worker(self, fn, *a, name="task", label=None):
         """Run fn on a thread. Refusing a double-start is a rail notice, never
@@ -1110,7 +1122,9 @@ class App(tk.Tk):
             self._prev_lbl.config(fg=theme.BAD)
             self.v_preview.set(str(e))
         else:
-            rows = [f"{datetime.fromtimestamp(t/1000):%m-%d %H:%M:%S}   还有 {_dur(t - adbutil.now_ms())}"
+            rows = [f"{datetime.fromtimestamp(t/1000):%m-%d %H:%M:%S}"
+                    + ("   已过" if t < adbutil.now_ms()
+                       else f"   还有 {_dur(t - adbutil.now_ms())}")
                     for t in ts]
             self.v_preview.set("\n".join(rows) if rows else "（空）")
         self.after(1000, self._update_preview)
@@ -1182,6 +1196,26 @@ class App(tk.Tk):
             if cur and cur != want:
                 self.log(f"  当前界面 {cur} / 选坐标时 {want}")
                 self.log("  界面已变，T-2.5s 会再核对一次，那才是关键")
+        # NTP runs here, once, before any countdown -- not inside the shot loop.
+        # It is bounded but still seconds-long when UDP 123 is blocked, and a
+        # query that starts after arm() has already approved the schedule will
+        # simply eat the slack it was validated against.
+        if opts["ntp"]:
+            slack = (ts[0] - adbutil.now_ms()) / 1000.0
+            if slack < 8:
+                self.log(f"!! 距第一发仅 {slack:.0f}s，跳过时钟校正，按本机表发射")
+                opts["ntp_off"] = 0.0
+            else:
+                t = time.time()
+                off, _ = adbutil.ntp_offset_ms(budget=min(6.0, max(2.0, slack - 4)))
+                opts["ntp_off"] = off if off is not None else 0.0
+                if off is None:
+                    self.log(f"!! NTP 不可达（{time.time()-t:.1f}s），按本机表发射。"
+                             "若本机时钟不准，命中会整体偏移")
+                else:
+                    self.log(f"  本机时钟偏差 {off:+.0f}ms 已补偿")
+        else:
+            opts["ntp_off"] = 0.0
         try:
             return self._run_schedule(ts, opts)
         finally:
@@ -1199,12 +1233,14 @@ class App(tk.Tk):
             the taps will actually land on, early enough to abort cleanly.
             One adb launch, because the budget it spends is the staging margin.
             A dark screen is a guaranteed miss, so only that one aborts."""
-            on, cur = adbutil.display_state()
+            on, cur = adbutil.display_state(timeout=1.5)
             if on is False and opts["phone_awake"]:
                 adbutil.wake_screen()
                 time.sleep(0.6)
                 self.log("  屏幕是熄的，已发送唤醒")
-                on, cur = adbutil.display_state()
+                on, cur = adbutil.display_state(timeout=1.5)
+            # None means "could not tell", which is not the same as "off":
+            # aborting a shot on a hung dumpsys would be worse than firing blind
             if on is False:
                 return "ABORT 屏幕仍处于熄灭状态，点击不会生效，已放弃这一发"
             if want and cur and cur != want:
@@ -1215,23 +1251,13 @@ class App(tk.Tk):
         # a full default 5ms slice right before the write
         old = sys.getswitchinterval()
         sys.setswitchinterval(0.0002)
-        off, off_at = 0.0, 0.0
+        off = opts.get("ntp_off", 0.0)
         shots = []
         try:
             for i, raw in enumerate(times):
                 if self.cancel.is_set():
                     self.log(f"已取消，剩余 {len(times)-i} 个时刻不再执行")
                     break
-                # an NTP round trip costs ~0.6s, so only spend a fresh one when
-                # there is room; hours apart is exactly when it matters
-                if opts["ntp"] and (raw - adbutil.now_ms()) > 3000:
-                    if (adbutil.now_ms() - off_at) > 60000:
-                        o, _ = adbutil.ntp_offset_ms()
-                        if o is None:
-                            self.log("!! NTP 不可达，这一发按本机表发射")
-                        else:
-                            off, off_at = o, adbutil.now_ms()
-                            self.log(f"  本机时钟偏差 {off:+.0f}ms 已补偿")
                 self.log(f"--- 第 {i+1}/{len(times)} 发  目标 {hms(raw - off)} ---")
                 before = adbutil.focus()
                 r = fire.one_shot(cfg, raw - off, False, say=self._say,

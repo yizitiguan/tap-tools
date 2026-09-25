@@ -15,7 +15,7 @@
   "mode": "sequence",
   "gap_ms": 40,
   "_comment_lead": "生效的是 lead_ms_by_mode[mode]。2026-09-24 实测：sequence 约 51ms，concurrent 约 72ms。phone_minus_pc_ms 已废弃——发射误差改用设备端同一时钟的前后时间差计算，不再依赖任何跨时钟偏移（手机会自动校时而本机 W32Time 停用，存偏移必然过期）。",
-  "lead_ms": 51.0,
+  "lead_ms": 59.0,
   "server_bias_ms": 0.0,
   "_comment_phone_off": "phone_minus_pc_ms is written by probe.py; used only for reporting.",
   "phone_minus_pc_ms": null,
@@ -75,7 +75,7 @@
   "_comment_gap": "请求 40~60ms。实测该值散布约 30~70ms——单发 input 进程返回时刻本身有 ±20ms 抖动，与目标区间同量级，所以别追求更细。真实间隔看「3 标定」页的实测行。",
   "lead_ms_by_mode": {
     "concurrent": 72.0,
-    "sequence": 51.0
+    "sequence": 59.0
   },
   "presets": {
     "sc": {
