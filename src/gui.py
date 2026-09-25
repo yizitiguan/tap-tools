@@ -372,6 +372,12 @@ class App(tk.Tk):
                                 font=theme.mono(11), padx=theme.L, pady=theme.M,
                                 text="尚未排练。排练结果会显示在这里。")
         self.cal_lbl.pack(fill="x")
+        # Replaces the "apply this?" dialog that used to pop after every
+        # rehearsal -- including while you were looking at another tab.
+        self._suggest = None
+        self.apply_chip = theme.chip(card, "", lambda: self._apply_suggest())
+        self.apply_chip.pack(anchor="w", padx=theme.L, pady=(0, theme.M))
+        self.apply_chip.pack_forget()
         self._callout(f, theme.INFO,
                       "排练用无害的空键码代替点击，走完全相同的时序路径，所以能在不点歪的前提下"
                       "把 lead_ms 标定准。\n每次临出发前重测一次：链路耗时会随温度和负载漂移几十毫秒。")
@@ -484,7 +490,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="预约发射", style="Primary.TButton",
                    command=self.arm).pack(side="left")
         ttk.Button(bar, text="取消", style="Danger.TButton",
-                   command=self.cancel.set).pack(side="left", padx=theme.S)
+                   command=self._do_cancel).pack(side="left", padx=theme.S)
         ttk.Button(bar, text="试射（10 秒后，不真点屏幕）", style="Ghost.TButton",
                    command=self.test_shot).pack(side="left")
         ttk.Button(bar, text="打开日志文件", style="Ghost.TButton",
@@ -702,8 +708,13 @@ class App(tk.Tk):
 
     def _worker(self, fn, *a, name="task", label=None):
         """Run fn on a thread. Refusing a double-start is a rail notice, never
-        a dialog -- a modal hides the countdown at the worst possible moment."""
-        if self.busy or self._armed:
+        a dialog -- a modal hides the countdown at the worst possible moment.
+
+        The arm task is exempt from the _armed guard: arm() raises that flag
+        itself before submitting, and _armed means "a watch is running", not
+        "this thread is busy". Forgetting the exemption makes 预约发射 a no-op.
+        """
+        if self.busy or (self._armed and name != "arm"):
             what = label or "上一个任务"
             secs = (adbutil.now_ms() - self._t0) / 1000.0 if self._t0 else 0
             self.q.put(("notice", (f"{what}还在进行（{secs:.0f}s），这次点击已忽略",
@@ -936,7 +947,8 @@ class App(tk.Tk):
         if name not in self.cfg.get("presets", {}):
             self.log("先在下拉里选中要删的预设")
             return
-        if not messagebox.askyesno("删除预设", f"删除「{name}」？坐标本身不会丢。"):
+        if not messagebox.askyesno("删除预设", f"删除「{name}」？坐标本身不会丢。",
+                                      parent=self):
             return
         del self.cfg["presets"][name]
         if self.cfg.get("active_preset") == name:
@@ -1024,14 +1036,32 @@ class App(tk.Tk):
                f"永不为早 → bias = {-min(e):.0f}\n"
                f"永不为晚 → bias = {-max(e):.0f}")
         self.cal_lbl.config(text=txt, fg=theme.TEXT)
+        self.apply_chip.pack_forget()
+        self._suggest = None
+        # A single sample is noise; the CLI's own spread is ±15ms run to run.
         if not (5 <= suggest <= 400):
             self.log(f"!! 建议值 {suggest:.0f}ms 超出合理范围(5~400)，已忽略；"
                      "请重跑一次排练")
+        elif len(res) < 3:
+            self.log(f"  样本仅 {len(res)} 次，不足以给出可应用的 lead 建议")
+        else:
+            self._suggest = (mode, round(suggest))
+            self.apply_chip.config(text=f"应用建议  lead_ms[{mode}] = {round(suggest)}")
+            self.apply_chip.pack(anchor="w", padx=theme.L, pady=(0, theme.M))
+
+    def _apply_suggest(self):
+        if not self._suggest:
             return
-        if messagebox.askyesno("应用", f"把 {mode} 的 lead_ms 改成 {suggest:.0f} 吗？"):
-            self.v_lead.set(round(suggest))
-            self._collect_cfg()
-            self.log(f"lead_ms[{mode}] -> {round(suggest)}")
+        mode, value = self._suggest
+        self._suggest = None
+        self.apply_chip.pack_forget()
+        if mode != self.v_mode.get():
+            self.log(f"!! 建议是给 {mode} 的，当前已切到 {self.v_mode.get()}，未应用")
+            return
+        self.v_lead.set(value)
+        self._collect_cfg()
+        self._sync_rail()
+        self.log(f"lead_ms[{mode}] -> {value}")
 
     # ---------- 4 fire ----------
     TIME_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
@@ -1067,6 +1097,11 @@ class App(tk.Tk):
         return out
 
     def _update_preview(self):
+        if self._armed:
+            # the rail countdown is the live readout while armed; do not let a
+            # 1 Hz strptime loop wake up inside the critical window
+            self.after(1000, self._update_preview)
+            return
         try:
             ts = self._resolve_times()
         except ValueError as e:
@@ -1083,30 +1118,9 @@ class App(tk.Tk):
     def arm(self):
         self._collect_cfg()
         self.cfg["target_times"] = self._time_lines()
-        save_cfg(self.cfg)
         if not self.cfg.get("tap_a") or not self.cfg.get("tap_b"):
             self.log("!! 先在「2 坐标」里取两个点")
             return
-        # pre-flight, so a dead connection fails the moment you click rather
-        # than after a countdown that looked like it was working
-        try:
-            adbutil.ensure_device()
-        except SystemExit as e:
-            self.big.config(text="设备不在线", foreground="#c00")
-            messagebox.showerror("设备不在线", f"{e}\n\n检查数据线、USB 调试和授权弹窗")
-            return
-        # tell them now, not after the countdown: coordinates belong to a
-        # specific screen, and a logged-out or scrolled-away page taps void
-        want = self.cfg.get("focus") or ""
-        cur = adbutil.focus()
-        if want and cur and cur != want:
-            self.log(f"!! 当前界面 {cur} 与选坐标时的 {want} 不一致")
-            if not messagebox.askyesno(
-                    "界面不一致",
-                    f"当前手机界面：\n  {cur}\n\n"
-                    f"选坐标时的界面：\n  {want}\n\n"
-                    "坐标可能落在错误的位置。仍要预约吗？"):
-                return
         try:
             ts = self._resolve_times()
         except ValueError as e:
@@ -1115,22 +1129,63 @@ class App(tk.Tk):
         if not ts:
             self.log("!! 目标时刻是空的")
             return
-        if ts[0] - adbutil.now_ms() < 3500:
-            self.log("!! 最近一发不足 4 秒，来不及做预热")
+        # warm.before_ms covers the pre-heat, but the shot also pays the
+        # post-warm settle and the pre-check adb round trip on top of it.
+        min_lead = self.cfg.get("warm", {}).get("before_ms", 5000) + 1200
+        if ts[0] - adbutil.now_ms() < min_lead:
+            self.log(f"!! 最近一发不足 {min_lead/1000:.1f} 秒，来不及预热和预检")
             return
-        # Snapshot every Tk-backed value NOW, on the main thread. Reading a
-        # variable from the worker raises "main thread is not in main loop",
-        # which used to abort the whole schedule before the first shot.
+
+        # Everything above is pure Python. Nothing between here and the thread
+        # start touches adb or the disk twice, so the click lands immediately
+        # even with the phone unplugged -- which used to hang for up to 15s
+        # inside ensure_device() while the button looked dead.
+        self.cancel.clear()
         opts = {"keepawake": self.v_keepawake.get(), "ntp": self.v_ntp.get(),
                 "want_focus": self.cfg.get("focus") or "",
                 "phone_awake": self.v_phone_awake.get()}
+        self.cfg["phone_stay_awake"] = opts["phone_awake"]
+        save_cfg(self.cfg)
         self.state_lbl.config(text="已预约", background=theme.AMBER, fg="#0d1014")
         self.rail_next.config(text=f"{len(ts)} 个时刻 · "
                              + ", ".join(datetime.fromtimestamp(t/1000).strftime("%H:%M:%S")
                                          for t in ts[:4]))
-        self.cfg["phone_stay_awake"] = opts["phone_awake"]
-        save_cfg(self.cfg)
-        self._worker(lambda: self._run_schedule(ts, opts))
+        self._armed = True
+        self._worker(lambda: self._preflight_then_schedule(ts, opts),
+                     name="arm", label="预约发射")
+
+    def _do_cancel(self):
+        """The worker only notices at its next sleep_until boundary, so colour
+        the state now -- a button that appears to do nothing gets clicked twice."""
+        self.cancel.set()
+        self.state_lbl.config(text="正在取消", background=theme.AMBER, fg="#0d1014")
+
+    def _preflight_then_schedule(self, ts, opts):
+        """Device reachability and the screen check belong on this thread."""
+        try:
+            serial = adbutil.ensure_device()
+            self.log(f"设备在线：{serial}，已预约 {len(ts)} 个时刻")
+        except SystemExit as e:
+            self._armed = False
+            self.q.put(("state", ("设备不在线", theme.BAD)))
+            self.q.put(("notice", (f"{e} —— 检查数据线、USB 调试和授权弹窗",
+                                   theme.BAD, 12000)))
+            return None
+        # Coordinates belong to one specific screen. Sampling it *now* is close
+        # to worthless (a 09:40 target armed at 20:00 is 13h away), so this is
+        # informational only and never blocks. The authoritative check is the
+        # precheck at T-2.5s. Skipped entirely when the shot is imminent, so it
+        # cannot double up with that one inside the pre-heat window.
+        want = opts["want_focus"]
+        if want and ts[0] - adbutil.now_ms() > 15000:
+            _, cur = adbutil.display_state()
+            if cur and cur != want:
+                self.log(f"  当前界面 {cur} / 选坐标时 {want}")
+                self.log("  界面已变，T-2.5s 会再核对一次，那才是关键")
+        try:
+            return self._run_schedule(ts, opts)
+        finally:
+            self._armed = False
 
     def _run_schedule(self, times, opts):
         cfg = dict(self.cfg)
@@ -1141,20 +1196,19 @@ class App(tk.Tk):
 
         def precheck():
             """Runs ~2.5s before the instant -- late enough to reflect the state
-            the taps will actually land on, early enough to still abort cleanly.
-            A dark screen is a guaranteed miss, so that one does abort."""
-            if opts["phone_awake"] and adbutil.screen_on() is False:
+            the taps will actually land on, early enough to abort cleanly.
+            One adb launch, because the budget it spends is the staging margin.
+            A dark screen is a guaranteed miss, so only that one aborts."""
+            on, cur = adbutil.display_state()
+            if on is False and opts["phone_awake"]:
                 adbutil.wake_screen()
                 time.sleep(0.6)
                 self.log("  屏幕是熄的，已发送唤醒")
-            if adbutil.screen_on() is False:
+                on, cur = adbutil.display_state()
+            if on is False:
                 return "ABORT 屏幕仍处于熄灭状态，点击不会生效，已放弃这一发"
-            if not want:
-                return None
-            cur = adbutil.focus()
-            if not cur or cur == want:
-                return None
-            self.log(f"  界面已变 期望 {want} / 实际 {cur}")
+            if want and cur and cur != want:
+                self.log(f"  界面已变 期望 {want} / 实际 {cur}")
             return None
         self._keep_awake(opts["keepawake"])
         # shrink the GIL hand-off quantum so the GUI thread cannot make us wait

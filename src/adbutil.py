@@ -214,6 +214,31 @@ def screen_on():
     return m.group(1).upper() == "ON"
 
 
+def display_state():
+    """(screen_on, focus) from ONE adb launch.
+
+    The pre-shot check used to spend three separate `dumpsys` subprocesses
+    inside the fixed window between warm-up and staging, which is the same
+    budget that decides whether the tap lands on time.
+    """
+    try:
+        out = sh("dumpsys display 2>/dev/null | grep -m1 'mScreenState=';"
+                 "dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus='")
+    except Exception:
+        return None, ""
+    on = None
+    m = re.search(r"mScreenState=(\w+)", out or "")
+    if m:
+        on = m.group(1).upper() == "ON"
+    focus = ""
+    for line in (out or "").splitlines():
+        if "mCurrentFocus" in line:
+            f = re.search(r"u\d+ (\S+?)}", line)
+            focus = f.group(1) if f else ""
+            break
+    return on, focus
+
+
 def ensure_device():
     out = subprocess.run(base() + ["devices"], capture_output=True, text=True,
                          timeout=15).stdout

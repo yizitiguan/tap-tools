@@ -15,14 +15,14 @@
   "mode": "sequence",
   "gap_ms": 40,
   "_comment_lead": "生效的是 lead_ms_by_mode[mode]。2026-09-24 实测：sequence 约 51ms，concurrent 约 72ms。phone_minus_pc_ms 已废弃——发射误差改用设备端同一时钟的前后时间差计算，不再依赖任何跨时钟偏移（手机会自动校时而本机 W32Time 停用，存偏移必然过期）。",
-  "lead_ms": 51,
+  "lead_ms": 51.0,
   "server_bias_ms": 0.0,
   "_comment_phone_off": "phone_minus_pc_ms is written by probe.py; used only for reporting.",
   "phone_minus_pc_ms": null,
   "_comment_warm": "the first `input` of the day pays a cold class-load. warm fires the same code path harmlessly (KEYCODE_UNKNOWN = no-op) a couple seconds before T. keep enabled unless it lags the bus.",
   "warm": {
     "enabled": true,
-    "before_ms": 2500,
+    "before_ms": 4000,
     "cmd": "input keyevent 0 & input keyevent 0 & wait"
   },
   "_comment_stage": "stage=true pre-writes the command body so only a 1-byte newline is written at T. turn off only to A/B test it.",
@@ -75,7 +75,7 @@
   "_comment_gap": "请求 40~60ms。实测该值散布约 30~70ms——单发 input 进程返回时刻本身有 ±20ms 抖动，与目标区间同量级，所以别追求更细。真实间隔看「3 标定」页的实测行。",
   "lead_ms_by_mode": {
     "concurrent": 72.0,
-    "sequence": 51
+    "sequence": 51.0
   },
   "presets": {
     "sc": {
@@ -91,7 +91,7 @@
   },
   "active_preset": "sc",
   "target_times": [
-    "09:40:00"
+    "11:24:37.000"
   ],
   "_comment_times": "每行一个时刻；只写 HH:MM:SS 会自动算今天（已过则明天），也可写完整日期。到点按先后依次自动开火。",
   "_comment_var": "单发 input 进程耗时实测 35~118ms，这是抖动的唯一来源：命中误差中位 ±10ms 但尾部到 ±65ms，两下间隔请求 40~60 实测 1~94。要压掉它只能换成设备常驻注入（uiautomator2 socket），不起进程。",
