@@ -4,21 +4,21 @@
   },
   "_comment_coords": "run: python pick.py  -- it fills tap_a / tap_b",
   "tap_a": {
-    "x": 148,
-    "y": 2072
+    "x": 880,
+    "y": 1472
   },
   "tap_b": {
     "x": 524,
-    "y": 2088
+    "y": 2076
   },
   "_comment_mode": "concurrent = two taps as close together as the OS allows (~40-80ms apart). sequence = force an explicit gap; use this if the app needs to see A before B, or to look human.",
   "mode": "sequence",
-  "gap_ms": 40,
-  "_comment_second": "second_tap=gap：第一下之后固定等 gap 再打第二下。=focus：第一下之后轮询 mCurrentFocus，界面一变立刻打第二下，超过 focus_max_ms 仍没变就按上限补打。2026-09-25 实测：请求 40~60ms 时设备端真实两下间隔散布 8.5~96ms（每个 input 进程自身耗时 35~118ms，且两次互不相关），小于 ~150ms 的 gap 等于抽签，所以「点完才出现的领取按钮」这类第二下必须用 focus。",
+  "gap_ms": 300,
+  "_comment_second": "second_tap=gap：第一下之后固定等 gap 再打第二下。=focus：第一下之后每 ~37ms 轮询一次 mCurrentFocus，界面一变立刻打第二下；gap_ms 是地板（不早于此），focus_max_ms 是天花板（超时也必打）。2026-09-25 实测依据：请求 40~60ms 时设备端真实两下间隔散布 8.5~96ms（单个 input 进程耗时 35~118ms 且两次互不相关），小于 150ms 等于抽签；Material 3 官方动效里弹窗/页面进入属 medium=250~400ms，所以地板取 300。天花板取 450 而不是 900：用户红线是「第一下到第二下点完 <600ms」，450+抖动 83 仍在线上。为什么不用控件识别：本机直播间页面 uiautomator dump 一次 2.2 秒（最坏 11.5 秒）且 127 个节点 text 全为空（TextureView 自绘，读不到字），screencap 一次 533~610ms，两者单独都超红线；只有 dumpsys window 的 37ms 探针用得起。",
   "second_tap": "focus",
-  "focus_max_ms": 900,
+  "focus_max_ms": 450,
   "_comment_lead": "生效的是 lead_ms_by_mode[mode]。2026-09-24 实测：sequence 约 51ms，concurrent 约 72ms。phone_minus_pc_ms 已废弃——发射误差改用设备端同一时钟的前后时间差计算，不再依赖任何跨时钟偏移（手机会自动校时而本机 W32Time 停用，存偏移必然过期）。",
-  "lead_ms": 77.0,
+  "lead_ms": 96.0,
   "server_bias_ms": 0.0,
   "_comment_phone_off": "phone_minus_pc_ms is written by probe.py; used only for reporting.",
   "phone_minus_pc_ms": null,
@@ -74,11 +74,11 @@
     "measured_at": "2026-09-24 18:09"
   },
   "_comment_bias": "8-shot spread was -14.5..+4.9ms. +20 shifts the whole window late so even the worst shot lands after T. For 抢票 early=button not live yet=dead shot; late=~20ms is nearly free. Set to 0 if the target is first-come-first-served and rivals are also automated.",
-  "gap_jitter_ms": 20,
+  "gap_jitter_ms": 0,
   "_comment_gap": "请求 40~60ms 时，设备端实测两下真正间隔散布 8.5~96ms（2026-09-25 共 35 个样本）——单个 input 进程自身耗时 35~118ms 且两次互不相关，所以别追求更细的 gap：要「必在第一下之后」就用 second_tap=focus。每次实发都会打印真实间隔。",
   "lead_ms_by_mode": {
     "concurrent": 72.0,
-    "sequence": 77.0
+    "sequence": 96.0
   },
   "presets": {
     "sc": {
@@ -94,19 +94,29 @@
     },
     "q1": {
       "tap_a": {
-        "x": 148,
-        "y": 2072
+        "x": 880,
+        "y": 1472
       },
       "tap_b": {
         "x": 524,
-        "y": 2088
+        "y": 2076
       },
       "focus": "com.ss.android.ugc.livelite/com.ss.android.ugc.aweme.bullet.ui.BulletContainerActivity"
+    },
+    "s1": {
+      "tap_a": {
+        "x": 880,
+        "y": 1472
+      },
+      "tap_b": {
+        "x": 524,
+        "y": 2076
+      }
     }
   },
-  "active_preset": "q1",
+  "active_preset": "s1",
   "target_times": [
-    "2026-09-25 16:07:20.000"
+    "2026-09-25 22:06:15.000"
   ],
   "_comment_times": "每行一个时刻；只写 HH:MM:SS 会自动算今天（已过则明天），也可写完整日期。到点按先后依次自动开火。",
   "_comment_var": "单发 input 进程耗时实测 35~118ms，这是抖动的唯一来源：命中误差中位 ±10ms 但尾部到 ±65ms，两下间隔请求 40~60 实测 1~94。要压掉它只能换成设备常驻注入（uiautomator2 socket），不起进程。",
