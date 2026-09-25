@@ -83,6 +83,8 @@ class App(tk.Tk):
         self.cancel = threading.Event()
         self.pts = []
         self._armed = False
+        self._watch_ev = None
+        self._next_ms = None
         self._t0 = None
         self._notice_job = None
         self._logfh = None
@@ -239,9 +241,12 @@ class App(tk.Tk):
         else:
             self.rail_preset.config(text="未设置坐标", fg=theme.BAD)
         m = self.v_mode.get()
+        sec = self.v_second.get()
         self.rail_mode.config(
             text=f"{m}   lead {fire.auto_lead(self.cfg, m):.0f}ms   "
-                 f"gap {self.v_gap.get()}+{self.v_jit.get()}ms")
+                 + (f"第二下等界面≤{self.v_fmax.get()}ms（地板 {self.v_gap.get()}ms）"
+                    if sec == "focus" and m == "sequence"
+                    else f"gap {self.v_gap.get()}+{self.v_jit.get()}ms"))
 
     def _tab_changed(self, _e=None):
         # grab once so the page is never blank; after that the user decides,
@@ -433,6 +438,8 @@ class App(tk.Tk):
         self.v_mode = tk.StringVar(value=self.cfg.get("mode", "sequence"))
         self.v_gap = tk.IntVar(value=self.cfg.get("gap_ms", 40))
         self.v_jit = tk.IntVar(value=self.cfg.get("gap_jitter_ms", 20))
+        self.v_second = tk.StringVar(value=self.cfg.get("second_tap", "gap"))
+        self.v_fmax = tk.IntVar(value=self.cfg.get("focus_max_ms", 900))
         self.v_lead = tk.DoubleVar(value=fire.auto_lead(self.cfg))
         self._lead_mode = self.v_mode.get()
         self.v_bias = tk.DoubleVar(value=self.cfg.get("server_bias_ms", 0))
@@ -448,9 +455,13 @@ class App(tk.Tk):
                 ("命中偏移 bias_ms", self.v_bias, 7,
                  "正数=命中更晚。抢票场景建议 +70，宁可晚不可早：早了按钮还没生效等于白按。"),
                 ("两下间隔下限", self.v_gap, 6,
-                 "sequence 模式下第一下与第二下的最小间隔。"),
+                 "第一下到第二下的最小间隔。gap 方式就按这个值发；"
+                 "等界面方式它是地板，第二下不会早于此。"),
                 ("两下间隔随机幅度", self.v_jit, 6,
-                 "每发在 下限 到 下限+幅度 之间随机。固定间隔本身就是机器特征。"))):
+                 "每发在 下限 到 下限+幅度 之间随机。固定间隔本身就是机器特征。"),
+                ("等界面最多等多久", self.v_fmax, 6,
+                 "仅「等界面变化」方式生效：第一下之后最多等这么久，界面一直"
+                 "没变就按这个上限补出第二下。"))):
             ttk.Label(grid, text=lab, style="Dim.TLabel").grid(
                 row=r, column=0, sticky="w", pady=(0 if r == 0 else theme.S))
             sp = ttk.Spinbox(grid, from_=-999, to=9999, textvariable=var, width=w,
@@ -471,6 +482,13 @@ class App(tk.Tk):
         cb.pack(side="left", padx=theme.S)
         cb.bind("<<ComboboxSelected>>", lambda e: (self._mode_changed(),
                                                    self._sync_rail()))
+        ttk.Label(opts, text="第二下").pack(side="left", padx=(theme.M, 0))
+        # gap only controls when the PC writes, which is not when the button
+        # appears; focus waits for the screen itself before letting tap B go.
+        cb2 = ttk.Combobox(opts, textvariable=self.v_second,
+                           values=["gap", "focus"], state="readonly", width=9)
+        cb2.pack(side="left", padx=theme.S)
+        cb2.bind("<<ComboboxSelected>>", lambda e: self._sync_rail())
         self._tip = tk.Label(right, justify="left", anchor="w",
                              bg=theme.SURFACE, fg=theme.FAINT, font=theme.ui(9),
                              wraplength=330, height=2,
@@ -600,6 +618,8 @@ class App(tk.Tk):
         elif kind == "result":
             name, payload = rest[0]
             if name == "arm":
+                if self._armed:
+                    return  # 已被新预约替换，退场的那次的结果不该改动当前值守
                 n = payload.get("shots") if isinstance(payload, dict) else None
                 self._set_idle(f"已发射 {n} 发" if n else "未发射",
                                theme.OK if n else theme.BAD)
@@ -718,27 +738,50 @@ class App(tk.Tk):
                             foreground=theme.FAINT)
         self.after(500, self._idle_clock)
 
-    def _worker(self, fn, *a, name="task", label=None):
-        """Run fn on a thread. Refusing a double-start is a rail notice, never
-        a dialog -- a modal hides the countdown at the worst possible moment.
+    # Inside this window the watch is pre-heating, staging and spinning; an adb
+    # call from another task lands on the same budget that decides whether the
+    # tap goes out on time.
+    CRITICAL_MS = 15000
 
-        The arm task is exempt from the _armed guard: arm() raises that flag
-        itself before submitting, and _armed means "a watch is running", not
-        "this thread is busy". Forgetting the exemption makes 预约发射 a no-op.
+    def _worker(self, fn, *a, name="task", label=None, watch=False):
+        """Run fn on a thread with its own cancel event, passed to fn as its
+        first argument. Refusing a double-start is a rail notice, never a
+        dialog -- a modal hides the countdown at the worst possible moment.
+
+        The watch deliberately does NOT hold `busy`. It used to, for the whole
+        countdown, i.e. minutes, so 预约发射 itself, 排练, 时钟测量 and 试射 were
+        all refused until the shot fired: re-typing a corrected time and clicking
+        预约 again looked like a dead button while the OLD schedule stayed armed.
+        That is how a shot gets missed with four minutes to spare.
         """
-        if self.busy or (self._armed and name != "arm"):
-            what = label or "上一个任务"
+        secs_left = ((self._next_ms - adbutil.now_ms())
+                     if (self._armed and self._next_ms) else None)
+        what = label or "上一个任务"
+        if self.busy:
             secs = (adbutil.now_ms() - self._t0) / 1000.0 if self._t0 else 0
             self.q.put(("notice", (f"{what}还在进行（{secs:.0f}s），这次点击已忽略",
                                    theme.AMBER, 6000)))
             return
-        self.busy = True
-        self._t0 = adbutil.now_ms()
-        self.cancel.clear()
+        if secs_left is not None and secs_left < self.CRITICAL_MS:
+            why = ("重排来不及预热，已忽略" if watch
+                   else "临界窗口内不接其他任务，已忽略")
+            self.q.put(("notice", (f"距第一发只有 {secs_left / 1000:.0f}s，{why}",
+                                   theme.AMBER, 8000)))
+            return
+        if watch and self._armed and self._watch_ev is not None:
+            self._watch_ev.set()
+            self.log("旧预约已被这次的时刻替换")
+        ev = threading.Event()
+        self.cancel = ev
+        if watch:
+            self._watch_ev = ev
+        else:
+            self.busy = True
+            self._t0 = adbutil.now_ms()
 
         def run():
             try:
-                r = fn(*a)
+                r = fn(ev, *a)
                 self.q.put(("result", (name, r)))
             except BaseException as e:
                 # SystemExit included: adbutil.ensure_device raises it, and an
@@ -748,9 +791,19 @@ class App(tk.Tk):
                 self.log(traceback.format_exc(limit=4))
                 self.q.put(("error", msg))
             finally:
-                self.busy = False
-                self._t0 = None
+                # Only the task that took the flag may drop it: the watch runs
+                # alongside ordinary tasks now, and clearing here would let a
+                # second 排练 overlap the first.
+                if not watch:
+                    self.busy = False
+                    self._t0 = None
         threading.Thread(target=run, daemon=True).start()
+
+    def _is_mine(self, ev):
+        """False once a newer 预约发射 has taken over. The superseded worker must
+        not undo the survivor's keep-awake settings or repaint the rail.
+        """
+        return ev is self._watch_ev
 
     def _say(self, m):
         self.log(m)
@@ -781,7 +834,7 @@ class App(tk.Tk):
         self._sync_rail()
 
     def check_inject(self):
-        def go():
+        def go(ev):
             try:
                 b = adbutil.sh("settings get system volume_music_speaker")
                 adbutil.sh("input keyevent 24")
@@ -971,7 +1024,7 @@ class App(tk.Tk):
 
     # ---------- 3 calibration ----------
     def do_ntp(self):
-        def go():
+        def go(ev):
             off, detail = adbutil.ntp_offset_ms()
             if off is None:
                 self.log("!! NTP 全部不可达（UDP 123 可能被拦），时钟不可信")
@@ -1002,6 +1055,8 @@ class App(tk.Tk):
         self.cfg["mode"] = self.v_mode.get()
         self.cfg["gap_ms"] = int(self.v_gap.get())
         self.cfg["gap_jitter_ms"] = int(self.v_jit.get())
+        self.cfg["second_tap"] = self.v_second.get()
+        self.cfg["focus_max_ms"] = int(self.v_fmax.get())
         lead = float(self.v_lead.get())
         self.cfg.setdefault("lead_ms_by_mode", {})[self.cfg["mode"]] = lead
         self.cfg["lead_ms"] = lead
@@ -1013,16 +1068,20 @@ class App(tk.Tk):
         self._collect_cfg()
         reps = int(self.v_reps.get())
 
-        def go():
+        def go(ev):
             cfg = dict(self.cfg)
+            # 排练量的是「写下这行到手机上真按下去」的链路耗时。focus 模式下第二下
+            # 的时刻由界面决定，keyevent 又不会让界面变，量出来的间隔只会是上限值，
+            # 所以标定一律走固定间隔。
+            cfg["second_tap"] = "gap"
             res = []
             for i in range(reps):
-                if self.cancel.is_set():
+                if ev.is_set():
                     break
                 t = adbutil.now_ms() + 4000
                 self.log(f"--- 排练 {i+1}/{reps} ---")
                 r = fire.one_shot(cfg, t, True, rehearse=True, say=self._say, tick=self._tick,
-                                  cancel=self.cancel.is_set)
+                                  cancel=ev.is_set)
                 if r:
                     res.append(r)
                 time.sleep(0.4)
@@ -1032,6 +1091,13 @@ class App(tk.Tk):
         self._worker(go, name="cal", label="排练")
 
     def _show_cal(self, res):
+        # end-stamp results carry a spacing but no landing error, and lead can
+        # only be tuned from the landing error -- 排练/试射 always come back in
+        # bracket form, so anything else here is not a calibration sample.
+        res = [x for x in res if x.get("first_late_ms") is not None]
+        if not res:
+            self.log("!! 这批结果没有命中误差，不能用来调 lead")
+            return
         e = [x["first_late_ms"] for x in res]
         sp = [x["spacing_ms"] for x in res]
         mode = self.v_mode.get()
@@ -1154,7 +1220,6 @@ class App(tk.Tk):
         # start touches adb or the disk twice, so the click lands immediately
         # even with the phone unplugged -- which used to hang for up to 15s
         # inside ensure_device() while the button looked dead.
-        self.cancel.clear()
         opts = {"keepawake": self.v_keepawake.get(), "ntp": self.v_ntp.get(),
                 "want_focus": self.cfg.get("focus") or "",
                 "phone_awake": self.v_phone_awake.get()}
@@ -1165,22 +1230,37 @@ class App(tk.Tk):
                              + ", ".join(datetime.fromtimestamp(t/1000).strftime("%H:%M:%S")
                                          for t in ts[:4]))
         self._armed = True
-        self._worker(lambda: self._preflight_then_schedule(ts, opts),
-                     name="arm", label="预约发射")
+        self._worker(lambda ev: self._preflight_then_schedule(ts, opts, ev),
+                     name="arm", label="预约发射", watch=True)
 
     def _do_cancel(self):
         """The worker only notices at its next sleep_until boundary, so colour
-        the state now -- a button that appears to do nothing gets clicked twice."""
-        self.cancel.set()
-        self.state_lbl.config(text="正在取消", background=theme.AMBER, fg="#0d1014")
+        the state now -- a button that appears to do nothing gets clicked twice.
 
-    def _preflight_then_schedule(self, ts, opts):
+        Aims at the watch specifically. `self.cancel` tracks whatever was
+        submitted last, so after a 排练 in the middle of a countdown this used to
+        un-cancel the very thing the button is meant to stop.
+        """
+        if self._armed and self._watch_ev is not None:
+            self._watch_ev.set()
+            self.state_lbl.config(text="正在取消", background=theme.AMBER, fg="#0d1014")
+            return
+        self.cancel.set()
+        self.q.put(("notice", ("当前没有进行中的预约", theme.FAINT, 4000)))
+
+    def _disarm(self):
+        self._armed = False
+        self._next_ms = None
+        self._watch_ev = None
+
+    def _preflight_then_schedule(self, ts, opts, ev):
         """Device reachability and the screen check belong on this thread."""
         try:
             serial = adbutil.ensure_device()
             self.log(f"设备在线：{serial}，已预约 {len(ts)} 个时刻")
         except SystemExit as e:
-            self._armed = False
+            if self._is_mine(ev):
+                self._disarm()
             self.q.put(("state", ("设备不在线", theme.BAD)))
             self.q.put(("notice", (f"{e} —— 检查数据线、USB 调试和授权弹窗",
                                    theme.BAD, 12000)))
@@ -1217,11 +1297,12 @@ class App(tk.Tk):
         else:
             opts["ntp_off"] = 0.0
         try:
-            return self._run_schedule(ts, opts)
+            return self._run_schedule(ts, opts, ev)
         finally:
-            self._armed = False
+            if self._is_mine(ev):
+                self._disarm()
 
-    def _run_schedule(self, times, opts):
+    def _run_schedule(self, times, opts, ev):
         cfg = dict(self.cfg)
         want = opts["want_focus"]
         if opts["phone_awake"]:
@@ -1255,29 +1336,37 @@ class App(tk.Tk):
         shots = []
         try:
             for i, raw in enumerate(times):
-                if self.cancel.is_set():
+                if ev.is_set():
                     self.log(f"已取消，剩余 {len(times)-i} 个时刻不再执行")
                     break
                 self.log(f"--- 第 {i+1}/{len(times)} 发  目标 {hms(raw - off)} ---")
+                self._next_ms = raw - off
                 before = adbutil.focus()
-                r = fire.one_shot(cfg, raw - off, False, say=self._say,
-                                  tick=self._tick, cancel=self.cancel.is_set,
+                # end_stamp: the shot is measured, but only by a trailing `date`,
+                # so a watched shot costs exactly what an unmeasured one did.
+                r = fire.one_shot(cfg, raw - off, True, end_stamp=True, say=self._say,
+                                  tick=self._tick, cancel=ev.is_set,
                                   precheck=precheck)
                 if r:
                     shots.append((i, before))
                 else:
                     self.log(f"  第 {i+1} 发未执行（错过时刻或被拦截）")
-                if not self.cancel.is_set():
+                if not ev.is_set():
                     time.sleep(1.0)
         finally:
             sys.setswitchinterval(old)
-            self._keep_awake(False)
-            if opts["phone_awake"]:
-                adbutil.stay_awake(False)
-                self.log("  已恢复手机休眠策略")
+            if self._is_mine(ev):
+                self._keep_awake(False)
+                if opts["phone_awake"]:
+                    adbutil.stay_awake(False)
+                    self.log("  已恢复手机休眠策略")
+            else:
+                self.log("  这次值守已被新预约替换，防睡眠设置交给新的那次收尾")
         # HyperOS 3 ignores show_taps, so there is no white circle to watch.
-        # Whether the foreground window changed is an objective substitute:
-        # a tap that did nothing anywhere is a tap you need to know about.
+        # Whether the foreground window changed is an objective substitute, but a
+        # weak one: a 领取 popup drawn inside the same Activity is invisible to
+        # mCurrentFocus, so "没变" never means the tap missed -- only that this
+        # check could not see anything move.
         for i, before in shots:
             after = adbutil.focus()
             if not before:
@@ -1286,8 +1375,8 @@ class App(tk.Tk):
                 self.log(f"  第 {i+1} 发后界面已变化：{before.split('/')[-1]} → "
                          f"{after.split('/')[-1]}  ← 点击确实生效了")
             else:
-                self.log(f"  第 {i+1} 发后界面没变（{after.split('/')[-1]}）"
-                         "  ← 点击可能落空：坐标不对、按钮未启用、或页面已变")
+                self.log(f"  第 {i+1} 发后焦点窗口未变（{after.split('/')[-1]}）"
+                         "  ← 同窗口内的弹层这里看不见，不代表没点上")
         return {"shots": len(shots)} if shots else None
 
     def _keep_awake(self, on):
@@ -1314,13 +1403,14 @@ class App(tk.Tk):
         self._collect_cfg()
         t = adbutil.now_ms() + 10000
         cfg = dict(self.cfg)
+        cfg["second_tap"] = "gap"   # keyevents never change the screen
 
-        def go():
+        def go(ev):
             self.log("--- 试射（排练模式，不会真点屏幕）---")
             # report the measurement: this is the only way to see the timing
             # of the actual GUI code path, since the CLI never imports gui.py
             r = fire.one_shot(cfg, t, True, rehearse=True, say=self._say,
-                              tick=self._tick, cancel=self.cancel.is_set)
+                              tick=self._tick, cancel=ev.is_set)
             if r:
                 self.q.put(("cal", [r]))
             return None

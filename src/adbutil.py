@@ -170,6 +170,27 @@ def ntp_offset_ms(servers=NTP_SERVERS, samples=3, budget=6.0):
     return med, best
 
 
+def _focus_of(text):
+    """The window name out of an mCurrentFocus line, "pkg/Activity" when there is
+    one. A system window reads as `Window{62508e4 u0 NotificationShade}`, and
+    that hash changes every time the window is rebuilt -- leaving it in would
+    make the second tap's "界面变了" test fire on an unchanged screen.
+    """
+    for line in text.splitlines():
+        if "mCurrentFocus" not in line or "=" not in line:
+            continue
+        w = line.split("=", 1)[1].strip()
+        if w.startswith("Window{"):
+            w = w[7:]
+        if w.endswith("}"):
+            w = w[:-1]
+        toks = w.split()
+        if len(toks) >= 3 and toks[1].startswith("u"):
+            return " ".join(toks[2:])
+        return w
+    return ""
+
+
 def focus():
     """Current foreground window as "package/Activity".
 
@@ -178,16 +199,24 @@ def focus():
     later -- e.g. a session that timed out and fell back to a login page.
     """
     try:
-        line = sh("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus")
+        return _focus_of(sh("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus"))
     except Exception:
         return ""
-    if "=" not in line:
+
+
+def focus_from(S, timeout=2.0):
+    """mCurrentFocus read through an already-open shell.
+
+    The second tap now waits for the screen to change, and that poll has to be
+    cheaper than the thing it is waiting for: sh() pays a Windows process launch
+    plus adb transport every call, which alone would put ~70ms on each round.
+    """
+    try:
+        _, out, _ = S.run("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus",
+                          timeout=timeout)
+    except Exception:
         return ""
-    w = line.split("=", 1)[1].strip().rstrip("}")
-    parts = w.split()
-    if len(parts) >= 2 and "/" in parts[-1]:
-        return parts[-1]
-    return w
+    return _focus_of("\n".join(out))
 
 
 def stay_awake(on):

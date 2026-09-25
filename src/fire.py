@@ -42,7 +42,7 @@ def resolve_target(spec):
     raise SystemExit(f"cannot parse target time {spec!r}")
 
 
-def build_cmd(a, b, verify, rehearse=False):
+def build_cmd(a, b, verify, rehearse=False, bracket=True):
     """One line that fires BOTH taps with `&`, so their ~70ms cold starts
     overlap and the two injections land ~2ms apart.
 
@@ -59,17 +59,27 @@ def build_cmd(a, b, verify, rehearse=False):
         A = f"input tap {a[0]} {a[1]}"
         B = f"input tap {b[0]} {b[1]}"
     if verify:
-        fa = f"(echo A0=$(date +%s%3N); {A}; echo A=$(date +%s%3N))"
-        fb = f"(echo B0=$(date +%s%3N); {B}; echo B=$(date +%s%3N))"
+        if bracket:
+            fa = f"(echo A0=$(date +%s%3N); {A}; echo A=$(date +%s%3N))"
+            fb = f"(echo B0=$(date +%s%3N); {B}; echo B=$(date +%s%3N))"
+        else:
+            fa = f"({A}; echo A=$(date +%s%3N))"
+            fb = f"({B}; echo B=$(date +%s%3N))"
     else:
         fa, fb = f"({A})", f"({B})"
     return f"{fa} & {fb} & wait"
 
 
-def _tap_cmd(p, tag, verify, rehearse):
+def _tap_cmd(p, tag, verify, rehearse, bracket=True):
     body = "input keyevent 0" if rehearse else f"input tap {p[0]} {p[1]}"
     if not verify:
         return body
+    if not bracket:
+        # Trailing stamp only. The leading `$(date)` costs a fork+exec that sits
+        # between the write() and the injection, so bracket mode pushes every
+        # real tap ~10-15ms later than the unmeasured path. Measuring a live
+        # shot must not change the shot.
+        return f"{body}; echo {tag}=$(date +%s%3N)"
     # Bracket the tap with two stamps from the SAME clock. Their difference is
     # the device-side duration and needs no phone<->PC offset, which is the
     # only stable way to report landing error: the phone auto-syncs its clock
@@ -84,13 +94,19 @@ def _num(s):
         return None
 
 
-def _read_pair(S, tag, timeout=5):
+def _read_pair(S, tag, timeout=5, need_start=True):
     """Device epochs bracketing one tap, as (before, after). Their difference is
-    a same-clock duration, so no phone<->PC offset is involved."""
+    a same-clock duration, so no phone<->PC offset is involved.
+
+    need_start=False matches the trailing-stamp form, where no `tag0=` line is
+    ever printed -- waiting for one would stall here for the whole timeout.
+    """
     p0, p1 = f"{tag}0=", f"{tag}="
     a = b = None
     deadline = time.time() + timeout
-    while time.time() < deadline and not (a and b):
+    while time.time() < deadline:
+        if b is not None and (a is not None or not need_start):
+            break
         try:
             line = S._readline().strip()
         except Exception:
@@ -102,16 +118,39 @@ def _read_pair(S, tag, timeout=5):
     return a, b
 
 
+def _wait_for_focus(poll, base, latest, cancel):
+    """Poll mCurrentFocus until it leaves `base`. Returns (pc_ms_seen, new_focus)
+    or (None, last) at `latest`.
+
+    A tap that lands on a dialog still being drawn is a tap on nothing, so the
+    only thing worth waiting for is the screen actually changing. Nothing sleeps
+    here: each dumpsys read costs ~50-150ms, which is the pacing.
+    """
+    last = ""
+    while adbutil.now_ms() < latest:
+        if cancel and cancel():
+            return None, last
+        last = adbutil.focus_from(poll)
+        now = adbutil.now_ms()
+        if last and last != base:
+            return now, last
+    return None, last
+
+
 def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck=None,
-             rehearse=False):
-    """Arm and fire once. Returns None when not verifying, else a dict of
-    measured timings in ms. `tick`/`cancel` let a GUI drive this without
-    owning a stdout. `precheck` runs just after warm-up -- still ~2.5s from the
-    instant, but late enough that the screen state is the one the taps will
-    actually land on -- and returning a message aborts the shot.
+             rehearse=False, end_stamp=False):
+    """Arm and fire once. Returns None when the shot was aborted before anything
+    was written, else a dict of measured timings in ms. `tick`/`cancel` let a GUI
+    drive this without owning a stdout. `precheck` runs just after warm-up --
+    still ~2.5s from the instant, but late enough that the screen state is the
+    one the taps will actually land on -- and returning a message aborts the shot.
 
     `rehearse` is an explicit argument, not a cfg key: persisting it once made
     every later real shot fire no-op keyevents forever.
+
+    `end_stamp` switches the measurement to a trailing-only stamp so a measured
+    shot costs the same as an unmeasured one; cfg["second_tap"]="focus" makes the
+    second tap wait for the screen to change instead of a fixed gap.
     """
     if tick is None:
         tick = cli_tick
@@ -125,7 +164,20 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
     t_send = target_ms - lead + bias
 
     seq = mode == "sequence"
-    sessions = [adbutil.Session() for _ in range(2 if seq else 1)]
+    # gap only controls when the PC writes. What the screen has done by then is
+    # a separate question, so focus mode replaces that moment with an observed
+    # change and keeps gap as the floor.
+    second_mode = cfg.get("second_tap", "gap") if seq else "gap"
+    fmax = float(cfg.get("focus_max_ms", 900))
+    poll = None
+    if second_mode == "focus":
+        # A third shell, because the one holding tap B's staged command is
+        # blocked mid-line: anything written there is glued onto tap B and
+        # parsed as one command.
+        sessions = [adbutil.Session() for _ in range(3)]
+        poll = sessions[2]
+    else:
+        sessions = [adbutil.Session() for _ in range(2 if seq else 1)]
     try:
         for S in sessions:
             S.run("echo 1", timeout=10)
@@ -134,10 +186,14 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
         if seq:
             gap = cfg.get("gap_ms", 40) + random.uniform(
                 0, max(0.0, cfg.get("gap_jitter_ms", 20)))
-            plan = [(sessions[0], _tap_cmd(a, "A", verify, rehearse), t_send),
-                    (sessions[1], _tap_cmd(b, "B", verify, rehearse), t_send + gap)]
+            plan = [(sessions[0],
+                     _tap_cmd(a, "A", verify, rehearse, not end_stamp), t_send),
+                    (sessions[1],
+                     _tap_cmd(b, "B", verify, rehearse, not end_stamp),
+                     t_send + gap)]
         else:
-            plan = [(sessions[0], build_cmd(a, b, verify, rehearse), t_send)]
+            plan = [(sessions[0],
+                     build_cmd(a, b, verify, rehearse, not end_stamp), t_send)]
 
         for S, cmd, at in plan:
             say(f"  send@{at:.1f}  {cmd}")
@@ -166,6 +222,20 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
                 if str(msg).startswith("ABORT"):
                     return None
 
+        # Baseline read ~3.5s out, next to the pre-check's own dumpsys and well
+        # clear of the staging margin. If it comes back empty there is nothing to
+        # compare against, so fall through to the plain gap rather than let the
+        # first non-empty reading count as a change.
+        base_focus = ""
+        if poll is not None:
+            base_focus = adbutil.focus_from(poll)
+            if base_focus:
+                say(f"  等界面变化：基准 {base_focus}，最早 {gap:.0f}ms 后，上限 {fmax:.0f}ms")
+            else:
+                say("  !! 焦点基准没读到，这一发改用固定间隔")
+                poll = None
+                second_mode = "gap"
+
         staged = cfg.get("stage", True)
         if staged:
             for S, cmd, at in plan:
@@ -178,7 +248,21 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
                     say(f"  !! staged too late ({margin:.0f}ms to fire) -- raise warm.before_ms")
 
         sent = {}
+        followed = False
         for i, (S, cmd, at) in enumerate(plan):
+            if i == 1 and poll is not None:
+                seen, new = _wait_for_focus(poll, base_focus, t_send + fmax, cancel)
+                if cancel and cancel():
+                    say("  cancelled before firing")
+                    return None
+                if seen is not None:
+                    at = max(seen, at)
+                    followed = True
+                    say(f"  界面在 T{seen - t_send:+.0f}ms 变为 {new}，第二下跟随")
+                else:
+                    at = t_send + fmax
+                    say(f"  !! 界面 {fmax:.0f}ms 内没变化（仍是 {new or '未知'}），"
+                        "按上限补出第二下")
             sleep_until(at, "fire", tick, cancel)
             if cancel and cancel():
                 say("  cancelled before firing")
@@ -186,7 +270,9 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
             late = adbutil.now_ms() - at
             # A late tap is not a degraded success, it is a miss. Report it as
             # one instead of firing seconds past the instant and printing 完成.
-            if late > cfg.get("max_late_ms", 150):
+            # Skipped once the screen itself set the moment -- that delay is the
+            # feature, not a slipped schedule.
+            if late > cfg.get("max_late_ms", 150) and not followed:
                 say(f"  ABORT 已错过时刻 {late:.0f}ms（上限 {cfg.get('max_late_ms',150)}ms），"
                     f"放弃这一发")
                 return None
@@ -196,9 +282,29 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
         if not verify:
             return {"send_pc": sent[0], "gap_req_ms": gap}
 
-        a0, a1 = _read_pair(sessions[0], "A")
+        a0, a1 = _read_pair(sessions[0], "A", need_start=not end_stamp)
         b_src = sessions[1] if seq else sessions[0]
-        b0, b1 = _read_pair(b_src, "B")
+        b0, b1 = _read_pair(b_src, "B", need_start=not end_stamp)
+
+        if end_stamp:
+            # Both stamps come off the device's own clock, so their difference IS
+            # the real inter-tap spacing with no phone<->PC offset involved --
+            # and its sign says which tap actually went first.
+            res = {"mode": mode, "gap_req_ms": gap, "send_pc": sent[0],
+                   "second_mode": second_mode,
+                   "followed_focus": followed}
+            if a1 is None or b1 is None:
+                # The taps are already on the screen. Never let a lost stamp read
+                # back to the caller as "this shot did not happen".
+                say("  !! 设备端时间戳没读全：两下都已打出，只是这次没量到间隔")
+                res["measured"] = False
+                return res
+            sp = b1 - a1
+            res.update({"measured": True, "spacing_ms": abs(sp), "signed_spacing_ms": sp})
+            say(f"  设备端两下真实间隔 {sp:+.0f}ms（请求 {gap:.0f}ms"
+                + ("，第二下反而先落）" if sp < 0 else "）"))
+            return res
+
         if not (a0 and a1 and b0 and b1):
             say("  !! device timestamps incomplete -- try --no-stage")
             return None

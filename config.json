@@ -4,18 +4,21 @@
   },
   "_comment_coords": "run: python pick.py  -- it fills tap_a / tap_b",
   "tap_a": {
-    "x": 156,
+    "x": 148,
     "y": 2072
   },
   "tap_b": {
-    "x": 528,
-    "y": 2040
+    "x": 524,
+    "y": 2088
   },
   "_comment_mode": "concurrent = two taps as close together as the OS allows (~40-80ms apart). sequence = force an explicit gap; use this if the app needs to see A before B, or to look human.",
   "mode": "sequence",
   "gap_ms": 40,
+  "_comment_second": "second_tap=gap：第一下之后固定等 gap 再打第二下。=focus：第一下之后轮询 mCurrentFocus，界面一变立刻打第二下，超过 focus_max_ms 仍没变就按上限补打。2026-09-25 实测：请求 40~60ms 时设备端真实两下间隔散布 8.5~96ms（每个 input 进程自身耗时 35~118ms，且两次互不相关），小于 ~150ms 的 gap 等于抽签，所以「点完才出现的领取按钮」这类第二下必须用 focus。",
+  "second_tap": "focus",
+  "focus_max_ms": 900,
   "_comment_lead": "生效的是 lead_ms_by_mode[mode]。2026-09-24 实测：sequence 约 51ms，concurrent 约 72ms。phone_minus_pc_ms 已废弃——发射误差改用设备端同一时钟的前后时间差计算，不再依赖任何跨时钟偏移（手机会自动校时而本机 W32Time 停用，存偏移必然过期）。",
-  "lead_ms": 65.0,
+  "lead_ms": 77.0,
   "server_bias_ms": 0.0,
   "_comment_phone_off": "phone_minus_pc_ms is written by probe.py; used only for reporting.",
   "phone_minus_pc_ms": null,
@@ -72,29 +75,41 @@
   },
   "_comment_bias": "8-shot spread was -14.5..+4.9ms. +20 shifts the whole window late so even the worst shot lands after T. For 抢票 early=button not live yet=dead shot; late=~20ms is nearly free. Set to 0 if the target is first-come-first-served and rivals are also automated.",
   "gap_jitter_ms": 20,
-  "_comment_gap": "请求 40~60ms。实测该值散布约 30~70ms——单发 input 进程返回时刻本身有 ±20ms 抖动，与目标区间同量级，所以别追求更细。真实间隔看「3 标定」页的实测行。",
+  "_comment_gap": "请求 40~60ms 时，设备端实测两下真正间隔散布 8.5~96ms（2026-09-25 共 35 个样本）——单个 input 进程自身耗时 35~118ms 且两次互不相关，所以别追求更细的 gap：要「必在第一下之后」就用 second_tap=focus。每次实发都会打印真实间隔。",
   "lead_ms_by_mode": {
     "concurrent": 72.0,
-    "sequence": 65.0
+    "sequence": 77.0
   },
   "presets": {
     "sc": {
       "tap_a": {
-        "x": 156,
+        "x": 148,
         "y": 2072
       },
       "tap_b": {
-        "x": 528,
-        "y": 2040
-      }
+        "x": 524,
+        "y": 2088
+      },
+      "focus": "com.ss.android.ugc.livelite/com.ss.android.ugc.aweme.bullet.ui.BulletContainerActivity"
+    },
+    "q1": {
+      "tap_a": {
+        "x": 148,
+        "y": 2072
+      },
+      "tap_b": {
+        "x": 524,
+        "y": 2088
+      },
+      "focus": "com.ss.android.ugc.livelite/com.ss.android.ugc.aweme.bullet.ui.BulletContainerActivity"
     }
   },
-  "active_preset": "sc",
+  "active_preset": "q1",
   "target_times": [
-    "12:00:00"
+    "2026-09-25 16:07:20.000"
   ],
   "_comment_times": "每行一个时刻；只写 HH:MM:SS 会自动算今天（已过则明天），也可写完整日期。到点按先后依次自动开火。",
   "_comment_var": "单发 input 进程耗时实测 35~118ms，这是抖动的唯一来源：命中误差中位 ±10ms 但尾部到 ±65ms，两下间隔请求 40~60 实测 1~94。要压掉它只能换成设备常驻注入（uiautomator2 socket），不起进程。",
-  "focus": "",
+  "focus": "com.ss.android.ugc.livelite/com.ss.android.ugc.aweme.bullet.ui.BulletContainerActivity",
   "phone_stay_awake": true
 }
