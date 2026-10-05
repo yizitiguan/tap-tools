@@ -197,7 +197,7 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
 
         for S, cmd, at in plan:
             say(f"  send@{at:.1f}  {cmd}")
-        say(f"  lead={lead:.1f}ms bias={bias:+.1f}ms gap={gap:.1f}ms")
+        say(f"  lead={lead:.1f}ms bias={bias:+.1f}ms gap={gap:.1f}ms second={second_mode}")
 
         # Warm-up must happen BEFORE staging: `Session.run` appends its own
         # newline-delimited command, and a staged body still missing its
@@ -326,7 +326,12 @@ def one_shot(cfg, target_ms, verify, say=print, tick=None, cancel=None, precheck
             f"spacing {out['spacing_ms']:6.1f}ms (asked {gap:.0f})")
         want = out["first_late_ms"] - bias
         out["mode"] = mode
-        out["suggest_lead_ms"] = auto_lead(cfg) - want
+        # first_late = bias - lead + dur_A, so the error `want` equals dur_A - lead:
+        # adding it lands lead exactly on dur_A. Subtracting (the old formula)
+        # gave 2*lead - dur and diverged: 96 -> 140 -> 224 -> 394 over four days,
+        # pushing the first tap ~300ms early while the 5~400 guard rejected every
+        # "suggestion" and froze lead at the bad value.
+        out["suggest_lead_ms"] = auto_lead(cfg) + want
         say(f"  => lead_ms[{mode}] {auto_lead(cfg):.1f} -> {out['suggest_lead_ms']:.1f}")
         return out
     finally:

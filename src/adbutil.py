@@ -186,8 +186,11 @@ def _focus_of(text):
             w = w[:-1]
         toks = w.split()
         if len(toks) >= 3 and toks[1].startswith("u"):
-            return " ".join(toks[2:])
-        return w
+            w = " ".join(toks[2:])
+        # While a window is being swapped out mCurrentFocus literally reads
+        # "null". That is not a screen change, it is "no answer" -- treating it
+        # as one made the second tap follow a transient instead of the popup.
+        return "" if w.strip() == "null" else w
     return ""
 
 

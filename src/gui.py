@@ -82,6 +82,12 @@ class App(tk.Tk):
         self.busy = False
         self.cancel = threading.Event()
         self.pts = []
+        # scale/W/H must exist before any screenshot: _redraw_marks divides by
+        # scale and _nudge clamps against W/H, both of which used to be created
+        # only inside grab() -- so the arrow keys raised an AttributeError on a
+        # page the user is now told not to screenshot.
+        self.scale = SCALE
+        self.W = self.H = 0
         self._armed = False
         self._watch_ev = None
         self._next_ms = None
@@ -249,13 +255,16 @@ class App(tk.Tk):
                     else f"gap {self.v_gap.get()}+{self.v_jit.get()}ms"))
 
     def _tab_changed(self, _e=None):
-        # grab once so the page is never blank; after that the user decides,
-        # otherwise every tab switch costs a ~1.3s screencap
+        # Opening this page used to take a screenshot so it was never blank.
+        # That cost 1.3s+ every session (and seconds more, or a hard fail, when
+        # the phone was locked), and the page is almost always opened just to
+        # re-check or nudge the points already saved -- so now it only loads
+        # those. 「重新截图」 is still there whenever a NEW point is needed.
         try:
             if (self.nb.index("current") == self.nb.index(self.tab_pos)
-                    and not getattr(self, "_grabbed_once", False)):
-                self._grabbed_once = True
-                self.after(50, self.grab)
+                    and not getattr(self, "_seeded_once", False)):
+                self._seeded_once = True
+                self.after(50, self._load_saved)
         except Exception:
             pass
 
@@ -354,8 +363,9 @@ class App(tk.Tk):
             self.bind(key, lambda e, x=dx, y=dy: self._nudge(x, y, 1))
             self.bind(key.replace("<", "<Shift-"), lambda e, x=dx, y=dy: self._nudge(x, y, 10))
         self._callout(f, theme.INFO,
-                      "在图上依次点两个按钮 → 方向键微调 1px（Shift 为 10px）→ 保存坐标 → 另存为预设。"
-                      "坐标属于当前这个界面，换页面必须重新取。")
+                      "打开本页不再自动截图，默认直接沿用上次保存的预设（方向键微调 1px、"
+                      "Shift 10px，改完「保存坐标」即可）。"
+                      "只有要重新取点时才按「重新截图」；坐标属于那个界面，换页面必须重取。")
 
     def _build_cal(self):
         f = self.tab_cal
@@ -470,6 +480,10 @@ class App(tk.Tk):
                     pady=(0 if r == 0 else theme.S))
             sp.bind("<Enter>", lambda e, h=help_: self._tip.config(text=h))
             sp.bind("<Leave>", lambda e: self._tip.config(text=""))
+            # Tk cycles spinbox/combobox values on MouseWheel while focused,
+            # silently: a stray scroll over 随机幅度 turned 0 into -1 and over
+            # 第二下 turned gap into focus, with nothing on screen to notice.
+            sp.bind("<MouseWheel>", lambda e: "break")
 
         opts = ttk.Frame(right, style="Panel.TFrame"); opts.pack(fill="x",
                                                                      pady=(theme.M, 0))
@@ -482,6 +496,7 @@ class App(tk.Tk):
         cb.pack(side="left", padx=theme.S)
         cb.bind("<<ComboboxSelected>>", lambda e: (self._mode_changed(),
                                                    self._sync_rail()))
+        cb.bind("<MouseWheel>", lambda e: "break")
         ttk.Label(opts, text="第二下").pack(side="left", padx=(theme.M, 0))
         # gap only controls when the PC writes, which is not when the button
         # appears; focus waits for the screen itself before letting tap B go.
@@ -818,6 +833,12 @@ class App(tk.Tk):
             info = [adbutil.sh(f"getprop {p}") for p in
                     ("ro.product.brand", "ro.product.model", "ro.build.version.release")]
             w, h = adbutil.dev_resolution()
+            # Needed even without a screenshot: _nudge clamps points against the
+            # real screen size, and the saved preset must be nudgeable anyway.
+            if (w, h) != (self.W, self.H):
+                self.W, self.H = w, h
+                if self.pts and not hasattr(self, "_disp"):
+                    self._redraw_marks()
             self.dev_info.config(fg=theme.TEXT, text=(
                 f"序列号    {serial}\n"
                 f"型号      {info[0]} {info[1]}\n"
@@ -870,6 +891,28 @@ class App(tk.Tk):
         self.v_auto.set(False)
         self.grab()
 
+    def _load_saved(self, quiet=False):
+        """把上次保存的两个点装回页面，不截图。
+
+        没有截图时画布是空白，但坐标数字照常显示、方向键照常微调、「保存坐标」
+        照常可用 —— 打开这页绝大多数时候只是为了核对上次的点。
+        """
+        if self.pts:
+            return                      # 手上有点还没保存，不能覆盖
+        self.pts = self._pts_from_cfg()
+        if not self.pts:
+            self.coord_lbl.config(text="尚未取样 —— 点「重新截图」后在图上取两个点")
+            return
+        if self.W:
+            self.scale = (self._fit_scale(self.H) if self.v_auto.get() else
+                          max(1, min(6, int(self.v_scale.get()))))
+            self.canvas.config(width=self.W // self.scale,
+                               height=self.H // self.scale)
+        self._redraw_marks()
+        if not quiet:
+            self.log(f"已沿用上次预设的 {len(self.pts)} 个点（未截图；"
+                     "要取新点再按「重新截图」）")
+
     def grab(self):
         try:
             adbutil.ensure_device()
@@ -913,7 +956,8 @@ class App(tk.Tk):
 
     def on_canvas(self, ev):
         if not hasattr(self, "_disp"):
-            self.log("先点「重新截图」")
+            self.log("没有底图取不了新点 —— 现在显示的是上次预设，方向键能微调；"
+                     "要重新取点请按「重新截图」")
             return
         x = min(max(int(round(ev.x * self.scale)), 0), self.W - 1)
         y = min(max(int(round(ev.y * self.scale)), 0), self.H - 1)
@@ -1369,7 +1413,10 @@ class App(tk.Tk):
         # check could not see anything move.
         for i, before in shots:
             after = adbutil.focus()
-            if not before:
+            # An unreadable side (mCurrentFocus literally reads "null" mid
+            # transition) is not evidence either way -- say nothing rather than
+            # report a change that was never seen.
+            if not (before and after):
                 continue
             if after != before:
                 self.log(f"  第 {i+1} 发后界面已变化：{before.split('/')[-1]} → "
