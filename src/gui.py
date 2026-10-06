@@ -657,7 +657,12 @@ class App(tk.Tk):
                 self._set_idle(f"已发射 {n} 发" if n else "未发射",
                                theme.OK if n else theme.BAD)
             elif name == "cal":
-                self._show_cal(payload)
+                # Rehearsal data arrives as its own explicit ("cal", res)
+                # event; the worker's return value is None by design, and
+                # feeding that to _show_cal only ever produced a spurious
+                # "NoneType is not iterable" after every batch.
+                if payload is not None:
+                    self._show_cal(payload)
         elif kind == "error":
             self._set_idle("失败 · 未发射", theme.BAD)
             self._show_notice(rest[0], theme.BAD, 15000)
