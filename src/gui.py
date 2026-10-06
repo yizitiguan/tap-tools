@@ -104,13 +104,20 @@ class App(tk.Tk):
         self._build()
         self.after(80, self._pump)
         self.after(500, self._idle_clock)
+        self.after(600, self._reflow_tabs)
         self.log(f"adb: {adbutil.ADB}")
         self.log(f"config: {CFG_PATH}")
         self.refresh_device()
 
     # ---------- layout ----------
     def _build(self):
-        self.columnconfigure(1, weight=1)
+        # The log column used to be the only weighted column, so any width
+        # shortfall (window narrower than the fire page requests) was dumped
+        # entirely onto the log, squeezing it to a few chars per line. Share
+        # surplus AND shortfall between the two columns instead, and floor
+        # the log at a readable width.
+        self.columnconfigure(0, weight=3, minsize=720)
+        self.columnconfigure(1, weight=1, minsize=320)
         self.rowconfigure(2, weight=1)
 
         # -- status rail: the countdown must survive tab switches -------------
@@ -235,6 +242,13 @@ class App(tk.Tk):
             os.startfile(str(p))
         else:
             self.log("还没有日志文件")
+
+    def _reflow_tabs(self):
+        # The tab strip can wrap against a transient startup/restore width and
+        # some themes never reflow it once the window reaches its real size,
+        # leaving the selected tab stranded on a second row. Re-asserting the
+        # tab padding invalidates that stale layout.
+        ttk.Style(self).configure("TNotebook.Tab", padding=(theme.L, theme.S + 2))
 
     def _sync_rail(self):
         """Keep the always-visible summary honest: device, active preset, mode."""
@@ -436,7 +450,8 @@ class App(tk.Tk):
         self.v_preview = tk.StringVar(value="")
         self._prev_lbl = tk.Label(prev, textvariable=self.v_preview, justify="left",
                                   anchor="w", bg=theme.RAISED, fg=theme.INFO,
-                                  font=theme.mono(11), padx=theme.L, pady=theme.M)
+                                  font=theme.mono(11), padx=theme.L, pady=theme.M,
+                                  wraplength=460)
         self._prev_lbl.pack(fill="x")
         self._update_preview()
 
@@ -510,9 +525,12 @@ class App(tk.Tk):
                              text="把鼠标停在任一数字框上，这里会解释它的作用。")
         self._tip.pack(fill="x", pady=(theme.S, 0))
 
+        self.v_aftershot = tk.BooleanVar(
+            value=self.cfg.get("post_shot_screenshot", False))
         for var, text in ((self.v_ntp, "发射前自动校正本机时钟"),
                           (self.v_phone_awake, "保持手机亮屏（USB 供电时不休眠）"),
-                          (self.v_keepawake, "值守期间阻止电脑睡眠")):
+                          (self.v_keepawake, "值守期间阻止电脑睡眠"),
+                          (self.v_aftershot, "发后存证截图（弹窗还在不在，看图定罪）")):
             ttk.Checkbutton(right, text=text, variable=var).pack(anchor="w")
 
         # -- actions ----------------------------------------------------------
@@ -1146,7 +1164,12 @@ class App(tk.Tk):
         sp = [x["spacing_ms"] for x in res]
         mode = self.v_mode.get()
         lead = float(self.v_lead.get()); bias = float(self.v_bias.get())
-        suggest = lead - (st.median(e) - bias)
+        # first_late = bias - lead + dur_A, so the lead that lands first_late
+        # on bias is lead + (first_late - bias). Subtracting (the old sign)
+        # made every rehearsal a positive-feedback loop: 96 -> 140 -> 224 ->
+        # 394, then 115 -> 181 -> 317, each step pushing tap #1 further early
+        # while still printing a confident-looking suggestion.
+        suggest = lead + (st.median(e) - bias)
         asked = [x.get("gap_req_ms", 0.0) for x in res]
         txt = (f"模式 {mode}   样本 {len(res)} 次\n"
                f"命中误差  中位 {st.median(e):+.1f}ms\n"
@@ -1268,6 +1291,7 @@ class App(tk.Tk):
                 "want_focus": self.cfg.get("focus") or "",
                 "phone_awake": self.v_phone_awake.get()}
         self.cfg["phone_stay_awake"] = opts["phone_awake"]
+        self.cfg["post_shot_screenshot"] = self.v_aftershot.get()
         save_cfg(self.cfg)
         self.state_lbl.config(text="已预约", background=theme.AMBER, fg="#0d1014")
         self.rail_next.config(text=f"{len(ts)} 个时刻 · "
@@ -1416,14 +1440,28 @@ class App(tk.Tk):
             # An unreadable side (mCurrentFocus literally reads "null" mid
             # transition) is not evidence either way -- say nothing rather than
             # report a change that was never seen.
-            if not (before and after):
-                continue
-            if after != before:
-                self.log(f"  第 {i+1} 发后界面已变化：{before.split('/')[-1]} → "
-                         f"{after.split('/')[-1]}  ← 点击确实生效了")
-            else:
-                self.log(f"  第 {i+1} 发后焦点窗口未变（{after.split('/')[-1]}）"
-                         "  ← 同窗口内的弹层这里看不见，不代表没点上")
+            if before and after:
+                if after != before:
+                    self.log(f"  第 {i+1} 发后界面已变化：{before.split('/')[-1]} → "
+                             f"{after.split('/')[-1]}  ← 点击确实生效了")
+                else:
+                    self.log(f"  第 {i+1} 发后焦点窗口未变（{after.split('/')[-1]}）"
+                             "  ← 同窗口内的弹层这里看不见，不代表没点上")
+            # HyperOS 3 draws no tap circle and mCurrentFocus cannot see a
+            # popup inside the same Activity, so the only hard evidence of
+            # where tap B landed / whether the dialog is still open is a
+            # picture. Taken >1s after the shot, outside the critical window.
+            # Opt-in (checkbox, default off): it costs an adb screencap.
+            if cfg.get("post_shot_screenshot"):
+                try:
+                    png = subprocess.run(adbutil.base() + ["exec-out", "screencap", "-p"],
+                                         capture_output=True, timeout=15).stdout
+                    if png and len(png) > 1000:
+                        p = adbutil.pkgdir() / f"shot_after_{i+1}.png"
+                        p.write_bytes(png)
+                        self.log(f"  第 {i+1} 发后存证截图：{p.name}")
+                except Exception:
+                    pass
         return {"shots": len(shots)} if shots else None
 
     def _keep_awake(self, on):
